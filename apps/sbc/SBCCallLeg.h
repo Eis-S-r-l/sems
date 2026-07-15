@@ -78,6 +78,52 @@ class SBCCallLeg : public CallLeg, public CredentialHolder
   PayloadIdMapping transcoder_payload_mapping;
 
   SBCCallProfile call_profile;
+  enum LocalReferProfileSide {
+    LocalReferProfileNone = 0,
+    LocalReferProfileA,
+    LocalReferProfileB
+  };
+
+  struct LocalReferContext {
+    LocalReferProfileSide profile_side;
+    AmSipRequest outbound_req;
+    bool active;
+    bool orchestrator;
+    bool subscription;
+    unsigned int refer_cseq;
+    unsigned int switch_cseq;
+    uint32_t previous_body_hash;
+    string target;
+    string transferor_id;
+    string new_leg_id;
+    AmSipRequest refer_req;
+    AmMimeBody previous_body;
+    MediaSessionHandover media_handover;
+    set<unsigned int> notify_cseqs;
+
+    LocalReferContext(LocalReferProfileSide side = LocalReferProfileNone,
+		      const AmSipRequest& req = AmSipRequest())
+      : profile_side(side), outbound_req(req), active(false),
+	orchestrator(false), subscription(false), refer_cseq(0),
+	switch_cseq(0), previous_body_hash(0)
+    { }
+
+    void clearTransfer() {
+      active = false;
+      orchestrator = false;
+      subscription = false;
+      refer_cseq = 0;
+      switch_cseq = 0;
+      previous_body_hash = 0;
+      target.clear();
+      transferor_id.clear();
+      new_leg_id.clear();
+      refer_req = AmSipRequest();
+      previous_body = AmMimeBody();
+      media_handover.clear();
+    }
+  };
+  unique_ptr<LocalReferContext> local_refer;
 
   // Rate limiting
   unique_ptr<RateLimit> rtp_relay_rate_limit;
@@ -123,6 +169,12 @@ class SBCCallLeg : public CallLeg, public CredentialHolder
   /** apply B leg configuration from call profile */
   void applyBProfile();
 
+  /** apply the A-side profile to an outbound local REFER leg */
+  void applyLocalReferALegProfile();
+
+  /** apply the B-side profile to an outbound local REFER leg */
+  void applyLocalReferBLegProfile();
+
   virtual void onCallStatusChange(const StatusChangeCause &cause);
   virtual void onBLegRefused(const AmSipReply& reply);
 
@@ -143,7 +195,30 @@ class SBCCallLeg : public CallLeg, public CredentialHolder
 
   void alterHoldRequestImpl(AmSdp &sdp); // do the SDP update (called by alterHoldRequest)
 
+  void handleLocalRefer(const AmSipRequest& req);
+  void onLocalReferStart(LocalReferStartEvent* ev);
+  void onLocalReferCreated(LocalReferCreatedEvent* ev);
+  void onLocalReferResult(LocalReferResultEvent* ev);
+  void onLocalReferAbort(LocalReferAbortEvent* ev);
+  bool onLocalReferCandidateReply(B2BSipReplyEvent* ev);
+  void abortLocalRefer();
+  void clearLocalReferTransfer();
+  int sendLocalReferNotify(unsigned int code, const string& reason, bool final);
+
  public:
+
+  static bool parseReferTarget(const AmSipRequest& req,
+			       const string& target_domain,
+			       string& target_party, string& target_uri,
+			       string& invite_hdrs,
+			       unsigned int& error_code,
+			       string& error_reason);
+  static bool buildLocalReferInvite(const string& original_from,
+				    const string& original_to,
+				    const string& target_party,
+				    const string& target_uri,
+				    const string& invite_hdrs,
+				    AmSipRequest& invite_req);
 
   SBCCallLeg(const SBCCallProfile& call_profile, AmSipDialog* dlg=NULL,
 	     AmSipSubscription* p_subs=NULL);

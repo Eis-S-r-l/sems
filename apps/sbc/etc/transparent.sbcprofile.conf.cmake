@@ -56,6 +56,15 @@
 ## append extra headers
 #append_headers="P-Source-IP: $si\r\nP-Source-Port: $sp\r\n"
 
+## REFER handling
+# relay  - forward REFER to the opposite call leg; default
+# local  - originate through the A-side profile and replace the current B leg
+# local requires refer_local_domain; Refer-To hosts are never routed directly
+#refer_mode=local
+# local REFER source: aleg, bleg (default), or both
+#refer_local_leg=bleg
+#refer_local_domain=outbound.example.net
+
 ## reply translations
 # translate some 6xx class replies to 4xx class:
 #reply_translations="603=>488 Not acceptable here|600=>406 Not Acceptable"

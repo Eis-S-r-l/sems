@@ -456,6 +456,12 @@ private:
 
   public:
     virtual void setMediaSession(AmB2BMedia *new_session);
+    /** Replace the media session without stopping the old one.
+     *
+     * The returned pointer owns the reference previously held by this
+     * session.  This is used by transactional media handovers which must be
+     * able to restore the old media session if a re-INVITE is rejected. */
+    AmB2BMedia *swapMediaSession(AmB2BMedia *new_session);
     AmB2BMedia *getMediaSession() { return media_session; }
 
     // media stream related callbacks

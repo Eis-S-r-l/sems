@@ -620,6 +620,58 @@ the REFER), the Replaces should be fixed in the INVITE message (fix_replaces_inv
 For situations where a PBX handles the call transfer (handles the REFER),
 the Replaces should be fixed in the REFER message (fix_replaces_ref=yes).
 
+REFER handling policy
+---------------------
+The refer_mode profile option controls in-dialog REFER requests:
+
+  refer_mode=relay
+  refer_mode=local
+
+relay is the default and preserves the existing behavior: REFER, its replies,
+and related NOTIFY requests are relayed to the opposite call leg. Any absent or
+unsupported value falls back to relay; local handling is enabled only by the
+exact supported value refer_mode=local.
+
+local accepts REFER on an established leg selected by refer_local_leg:
+
+  refer_local_leg=bleg
+  refer_local_leg=aleg
+  refer_local_leg=both
+
+bleg is the default for backward compatibility. A REFER from any other leg is
+rejected with 403. The opposite leg is retained while a new outbound leg is
+created through the profile side of that retained leg. Thus a B-leg REFER uses
+aleg_next_hop, aleg_outbound_proxy, aleg_outbound_interface, A-side RTP policy,
+authentication, and request headers; an A-leg REFER uses the corresponding
+B-side settings. The transferor leg is retained until the new leg answers
+successfully and the SDP re-INVITE to the retained leg completes. Failure of
+the new INVITE or of that SDP update removes only the new leg and leaves the
+original call connected.
+
+Local mode also requires a fixed target domain:
+
+  refer_local_domain=outbound.example.net
+
+tel:, sip:, and sips: Refer-To targets are reduced to their numeric user part
+and normalized to sip:user@refer_local_domain;user=phone. Numeric users may
+contain an optional leading '+' and up to 32 digits. The new INVITE uses the
+remote party of the retained leg as From, puts the normalized Refer-To target
+in To and Request-URI, and adds the retained leg's local party as:
+
+  Diversion: <original-called-uri>;reason=unconditional;counter=1
+
+Local handling acts as the referee subscription endpoint. It sends an initial
+NOTIFY with a message/sipfrag 100 response and a final terminated NOTIFY with
+the transfer result. Refer-Sub: false suppresses this implicit subscription and
+the NOTIFY requests. Each transfer candidate receives a new Call-ID; an
+evaluated Call-ID belonging to an existing B leg is not reused.
+
+Security warning: local mode can originate calls. A missing or invalid
+refer_local_domain disables local origination. The host supplied in Refer-To is
+never used as a network destination; A-side routing or DNS resolution of the
+configured domain is used instead. URI headers other than Replaces and
+Require: replaces are rejected. Only one local transfer may be active per call.
+
 Reliable 1xx (PRACK)
 --------------------
 

@@ -36,6 +36,7 @@
 #include "AmConfigReader.h"
 #include "AmSessionContainer.h"
 #include "AmSipHeaders.h"
+#include "AmUriParser.h"
 #include "SBCSimpleRelay.h"
 #include "RegisterDialog.h"
 #include "SubscriptionDialog.h"
@@ -51,6 +52,7 @@
 #include "SBC.h"
 
 #include <algorithm>
+#include <cctype>
 
 using namespace std;
 
@@ -85,6 +87,218 @@ static const SdpPayload *findPayload(const std::vector<SdpPayload>& payloads, co
 static bool containsPayload(const std::vector<SdpPayload>& payloads, const SdpPayload &payload, int transport)
 {
   return findPayload(payloads, payload, transport) != NULL;
+}
+
+static unsigned int countHeader(const string& hdrs, const string& name,
+				const string& compact, string& value)
+{
+  unsigned int count = 0;
+  const string names[] = { name, compact };
+  for (unsigned int n = 0; n < 2; n++) {
+    if (names[n].empty()) continue;
+    size_t skip = 0, pos1 = 0, pos2 = 0, hdr_start = 0;
+    while (findHeader(hdrs, names[n], skip, pos1, pos2, hdr_start)) {
+      if (!count) value = hdrs.substr(pos1, pos2 - pos1);
+      count++;
+      skip = pos2 + 1;
+    }
+  }
+  return count;
+}
+
+static bool isReferPhoneUser(const string& user)
+{
+  if (user.empty() || user.size() > 33) return false;
+
+  string::const_iterator it = user.begin();
+  if (*it == '+') {
+    if (++it == user.end()) return false;
+  }
+  if (static_cast<size_t>(user.end() - it) > 32) return false;
+  for (; it != user.end(); ++it) {
+    if (!isdigit(static_cast<unsigned char>(*it))) return false;
+  }
+  return true;
+}
+
+bool SBCCallLeg::parseReferTarget(const AmSipRequest& req,
+				 const string& target_domain,
+				 string& target_party, string& target_uri,
+				 string& invite_hdrs,
+				 unsigned int& error_code, string& error_reason)
+{
+  string refer_to;
+  unsigned int header_count = countHeader(req.hdrs, SIP_HDR_REFER_TO,
+					  SIP_HDR_REFER_TO_COMPACT, refer_to);
+  if (!header_count) {
+    error_code = 400;
+    error_reason = "Missing Refer-To";
+    return false;
+  }
+  if (header_count != 1 || refer_to.size() > 2048) {
+    error_code = 400;
+    error_reason = "Invalid Refer-To";
+    return false;
+  }
+
+  if (!SBCCallProfile::isValidReferLocalDomain(target_domain)) {
+    error_code = 403;
+    error_reason = "Refer target forbidden";
+    return false;
+  }
+
+  // AmUriParser accepts arbitrary URI schemes inside name-addr brackets, but
+  // its bare addr-spec parser only recognizes SIP URIs.  Refer-To explicitly
+  // permits both forms, so canonicalize a bare tel URI before parsing it.
+  string parsed_refer_to = trim(refer_to, " \t");
+  if (!parsed_refer_to.empty() && parsed_refer_to[0] != '<') {
+    size_t scheme_end = parsed_refer_to.find(':');
+    string bare_scheme = scheme_end == string::npos ? "" :
+      parsed_refer_to.substr(0, scheme_end);
+    transform(bare_scheme.begin(), bare_scheme.end(), bare_scheme.begin(),
+	      ::tolower);
+    if (bare_scheme == "tel")
+      parsed_refer_to = "<" + parsed_refer_to + ">";
+  }
+
+  AmUriParser target;
+  size_t end = 0;
+  if (!target.parse_contact(parsed_refer_to, 0, end)) {
+    error_code = 400;
+    error_reason = "Invalid Refer-To";
+    return false;
+  }
+
+  size_t scheme_start = 0;
+  while (scheme_start < target.uri.size() &&
+	 isspace(static_cast<unsigned char>(target.uri[scheme_start])))
+    scheme_start++;
+  if (scheme_start < target.uri.size() && target.uri[scheme_start] == '<')
+    scheme_start++;
+
+  size_t scheme_end = target.uri.find(':', scheme_start);
+  string scheme = scheme_end == string::npos ? "" :
+    target.uri.substr(scheme_start, scheme_end - scheme_start);
+  transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+  if (scheme != "tel" && scheme != "sip" && scheme != "sips") {
+    error_code = 501;
+    error_reason = "Refer target scheme unsupported";
+    return false;
+  }
+
+  string target_user;
+  if (scheme == "tel") {
+    target_user = target.uri_host;
+  }
+  else {
+    target_user = target.uri_user;
+    if (target.uri_host.empty()) {
+      error_code = 400;
+      error_reason = "Invalid Refer-To";
+      return false;
+    }
+  }
+
+  if (!isReferPhoneUser(target_user)) {
+    error_code = 400;
+    error_reason = "Invalid Refer-To";
+    return false;
+  }
+
+  string uri_params(target.uri_param);
+  transform(uri_params.begin(), uri_params.end(), uri_params.begin(), ::tolower);
+  if (!uri_params.empty() &&
+      !((scheme == "sip" || scheme == "sips") && uri_params == "user=phone")) {
+    error_code = 403;
+    error_reason = "Refer target forbidden";
+    return false;
+  }
+  if (!target.params.empty()) {
+    error_code = 403;
+    error_reason = "Refer target forbidden";
+    return false;
+  }
+
+  invite_hdrs.clear();
+  if (!target.uri_headers.empty()) {
+    string uri_headers(target.uri_headers);
+    replace(uri_headers.begin(), uri_headers.end(), '&', ';');
+    vector<string> headers = explode(uri_headers, ";");
+    for (vector<string>::const_iterator it = headers.begin(); it != headers.end(); ++it) {
+      string decoded = URL_decode(*it);
+      if (decoded.find('\r') != string::npos || decoded.find('\n') != string::npos) {
+        error_code = 400;
+        error_reason = "Invalid Refer-To";
+        return false;
+      }
+
+      size_t sep = decoded.find_first_of("=:");
+      if (sep == string::npos) {
+        error_code = 400;
+        error_reason = "Invalid Refer-To";
+        return false;
+      }
+      string name = trim(decoded.substr(0, sep), " \t");
+      string value = trim(decoded.substr(sep + 1), " \t");
+      string lname(name);
+      transform(lname.begin(), lname.end(), lname.begin(), ::tolower);
+      if (lname == "replaces") {
+        invite_hdrs += SIP_HDR_COLSP(SIP_HDR_REPLACES) + value + CRLF;
+      }
+      else if (lname == "require") {
+        string lvalue(value);
+        transform(lvalue.begin(), lvalue.end(), lvalue.begin(), ::tolower);
+        if (lvalue != "replaces") {
+          error_code = 403;
+          error_reason = "Refer target forbidden";
+          return false;
+        }
+        invite_hdrs += SIP_HDR_COLSP(SIP_HDR_REQUIRE) + value + CRLF;
+      }
+      else {
+        error_code = 403;
+        error_reason = "Refer target forbidden";
+        return false;
+      }
+    }
+  }
+
+  target_uri = "sip:" + target_user + "@" + target_domain + ";user=phone";
+  target_party = "<" + target_uri + ">";
+  return true;
+}
+
+bool SBCCallLeg::buildLocalReferInvite(const string& original_from,
+				       const string& original_to,
+				       const string& target_party,
+				       const string& target_uri,
+				       const string& invite_hdrs,
+				       AmSipRequest& invite_req)
+{
+  AmUriParser from;
+  AmUriParser diversion;
+  AmUriParser target;
+  if (!from.parse_nameaddr(original_from) ||
+      !diversion.parse_nameaddr(original_to))
+    return false;
+
+  target.uri = target_uri;
+  if (!target.parse_uri() || target.uri_user.empty() ||
+      target.uri_host.empty())
+    return false;
+
+  invite_req.method = SIP_METH_INVITE;
+  invite_req.r_uri = target_uri;
+  invite_req.user = target.uri_user;
+  invite_req.domain = target.uri_host;
+  invite_req.from = original_from;
+  invite_req.from_uri = from.uri;
+  invite_req.to = target_party;
+  invite_req.hdrs = invite_hdrs;
+  invite_req.hdrs += "Diversion: " + original_to +
+    ";reason=unconditional;counter=1" CRLF;
+  invite_req.first_hop = false;
+  return true;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////
@@ -229,7 +443,13 @@ void SBCCallLeg::onStart()
 {
   // this should be the first thing called in session's thread
   CallLeg::onStart();
-  if (!a_leg) applyBProfile(); // A leg needs to evaluate profile first
+  LocalReferProfileSide profile_side = local_refer.get() ?
+    local_refer->profile_side : LocalReferProfileNone;
+  if (profile_side == LocalReferProfileA)
+    applyLocalReferALegProfile();
+  else if (profile_side == LocalReferProfileB)
+    applyLocalReferBLegProfile();
+  else if (!a_leg) applyBProfile(); // A leg needs to evaluate profile first
   else if (!getOtherId().empty()) {
     // A leg but we already have a peer, what means that this call leg was
     // created as an A leg for already existing B leg (for example call
@@ -238,6 +458,8 @@ void SBCCallLeg::onStart()
     // "outbound" profile though we are in A leg
     applyBProfile();
   }
+  if (profile_side != LocalReferProfileNone && local_refer.get())
+    local_refer->outbound_req = AmSipRequest();
 }
 
 void SBCCallLeg::applyAProfile(const AmSipRequest &req)
@@ -491,11 +713,48 @@ void SBCCallLeg::applyBProfile()
   }
 
   // was read from caller but reading directly from profile now
-  if (!call_profile.callid.empty()) 
+  if (!call_profile.callid.empty())
     dlg->setCallid(call_profile.callid);
 
   if(!call_profile.bleg_dlg_contact_params.empty())
     dlg->setContactParams(call_profile.bleg_dlg_contact_params);
+}
+
+void SBCCallLeg::applyLocalReferALegProfile()
+{
+  if (call_profile.auth_aleg_enabled) {
+    AmSessionEventHandlerFactory* uac_auth_f =
+      AmPlugIn::instance()->getFactory4Seh("uac_auth");
+    if (NULL == uac_auth_f) {
+      ILOG_DLG(L_INFO, "uac_auth module not loaded. A-side auth for local "
+	       "REFER leg NOT enabled.\n");
+    }
+    else {
+      setAuthHandler(uac_auth_f->getHandler(this));
+      ILOG_DLG(L_DBG, "A-side uac auth enabled for local REFER leg.\n");
+    }
+  }
+
+  if (call_profile.sst_aleg_enabled == "yes" &&
+      applySSTCfg(call_profile.sst_a_cfg, NULL) < 0)
+    throw AmSession::Exception(500, SIP_REPLY_SERVER_INTERNAL_ERROR);
+
+  if (!local_refer.get())
+    throw AmSession::Exception(500, SIP_REPLY_SERVER_INTERNAL_ERROR);
+
+  applyAProfile(local_refer->outbound_req);
+  ParamReplacerCtx ctx(&call_profile);
+  if (call_profile.apply_a_routing(ctx, local_refer->outbound_req, *dlg) < 0)
+    throw AmSession::Exception(500, SIP_REPLY_SERVER_INTERNAL_ERROR);
+}
+
+void SBCCallLeg::applyLocalReferBLegProfile()
+{
+  // The profile Call-ID was evaluated for the original B leg. Preserve the
+  // generated dialog Call-ID while applying the otherwise unchanged B profile.
+  string generated_callid = dlg->getCallid();
+  applyBProfile();
+  dlg->setCallid(generated_callid);
 }
 
 int SBCCallLeg::relayEvent(AmEvent* ev)
@@ -604,6 +863,7 @@ SBCCallLeg::~SBCCallLeg()
 
 void SBCCallLeg::onBeforeDestroy()
 {
+  abortLocalRefer();
   for (vector<ExtendedCCInterface*>::iterator i = cc_ext.begin(); i != cc_ext.end(); ++i) {
     try {
       (*i)->onDestroyLeg(this);
@@ -614,8 +874,346 @@ void SBCCallLeg::onBeforeDestroy()
 }
 
 UACAuthCred* SBCCallLeg::getCredentials() {
+  LocalReferProfileSide profile_side = local_refer.get() ?
+    local_refer->profile_side : LocalReferProfileNone;
+  if (profile_side == LocalReferProfileA)
+    return &call_profile.auth_aleg_credentials;
+  if (profile_side == LocalReferProfileB)
+    return &call_profile.auth_credentials;
   if (a_leg) return &call_profile.auth_aleg_credentials;
-  else return &call_profile.auth_credentials;
+  return &call_profile.auth_credentials;
+}
+
+void SBCCallLeg::clearLocalReferTransfer()
+{
+  if (!local_refer.get()) return;
+  local_refer->clearTransfer();
+  if (local_refer->profile_side == LocalReferProfileNone &&
+      local_refer->notify_cseqs.empty())
+    local_refer.reset();
+}
+
+int SBCCallLeg::sendLocalReferNotify(unsigned int code, const string& reason,
+				     bool final)
+{
+  if (!local_refer.get() || !local_refer->subscription) return 0;
+  LocalReferContext& refer = *local_refer;
+
+  string sipfrag = "SIP/2.0 " + int2str(code) + " " + reason + CRLF;
+  AmMimeBody body;
+  if (body.parse("message/sipfrag", sipfrag.c_str(), sipfrag.length()) < 0)
+    return -1;
+
+  string hdrs = SIP_HDR_COLSP(SIP_HDR_EVENT) "refer;id=" +
+    int2str(refer.refer_cseq) + CRLF;
+  hdrs += SIP_HDR_COLSP(SIP_HDR_SUBSCRIPTION_STATE);
+  hdrs += final ? "terminated;reason=noresource" : "active;expires=600";
+  hdrs += CRLF;
+
+  unsigned int notify_cseq = dlg->cseq;
+  int res = dlg->sendRequest(SIP_METH_NOTIFY, &body, hdrs, SIP_FLAGS_VERBATIM);
+  if (!res) refer.notify_cseqs.insert(notify_cseq);
+  return res;
+}
+
+void SBCCallLeg::handleLocalRefer(const AmSipRequest& req)
+{
+  string refer_to = getHeader(req.hdrs, SIP_HDR_REFER_TO,
+			      SIP_HDR_REFER_TO_COMPACT, true);
+
+  if (getCallStatus() != Connected) {
+    ILOG_DLG(L_WARN, "local REFER rejected on leg %s, profile '%s', "
+		     "Refer-To '%s': call leg is not established\n",
+		     getLocalTag().c_str(), call_profile.profile_file.c_str(),
+		     refer_to.c_str());
+    dlg->reply(req, 403, "Refer target forbidden");
+    return;
+  }
+
+  if (!call_profile.allowsLocalRefer(a_leg)) {
+    ILOG_DLG(L_WARN, "local REFER rejected on %c leg %s, profile '%s', "
+		     "Refer-To '%s': refer_local_leg=%s\n",
+		     a_leg ? 'A' : 'B', getLocalTag().c_str(),
+	     call_profile.profile_file.c_str(), refer_to.c_str(),
+	     SBCCallProfile::referLocalLegToStr(
+		       call_profile.getReferLocalLeg()));
+    dlg->reply(req, 403, "Refer target forbidden");
+    return;
+  }
+
+  if (local_refer.get() &&
+      (local_refer->active || !local_refer->notify_cseqs.empty())) {
+    ILOG_DLG(L_WARN, "local REFER rejected on leg %s, profile '%s', "
+		     "Refer-To '%s': transfer already active\n",
+		     getLocalTag().c_str(), call_profile.profile_file.c_str(),
+		     refer_to.c_str());
+    dlg->reply(req, 491, SIP_REPLY_PENDING);
+    return;
+  }
+
+  if (!call_profile.hasLocalReferRouting()) {
+    ILOG_DLG(L_WARN, "local REFER rejected on leg %s, profile '%s', "
+		     "Refer-To '%s': no valid refer_local_domain\n",
+		     getLocalTag().c_str(), call_profile.profile_file.c_str(),
+		     refer_to.c_str());
+    dlg->reply(req, 403, "Refer target forbidden");
+    return;
+  }
+
+  string target_party, target_uri, invite_hdrs;
+  unsigned int error_code = 400;
+  string error_reason;
+
+  if (!parseReferTarget(req, call_profile.getReferLocalDomain(),
+			target_party, target_uri, invite_hdrs,
+			error_code, error_reason)) {
+    ILOG_DLG(L_WARN, "local REFER rejected on leg %s, profile '%s', "
+		     "Refer-To '%s': %s\n", getLocalTag().c_str(),
+		     call_profile.profile_file.c_str(), refer_to.c_str(),
+		     error_reason.c_str());
+    dlg->reply(req, error_code, error_reason);
+    return;
+  }
+
+  ILOG_DLG(L_INFO, "local REFER accepted for validation on leg %s, "
+	   "profile '%s': Refer-To '%s' normalized to '%s'\n",
+	   getLocalTag().c_str(), call_profile.profile_file.c_str(),
+	   refer_to.c_str(), target_uri.c_str());
+
+  string refer_sub = getHeader(req.hdrs, "Refer-Sub", true);
+  transform(refer_sub.begin(), refer_sub.end(), refer_sub.begin(), ::tolower);
+
+  LocalReferProfileSide profile_side = local_refer.get() ?
+    local_refer->profile_side : LocalReferProfileNone;
+  local_refer.reset(new LocalReferContext(profile_side));
+  LocalReferContext& refer = *local_refer;
+  refer.active = true;
+  refer.orchestrator = false;
+  refer.subscription = trim(refer_sub, " \t") != "false";
+  refer.refer_cseq = req.cseq;
+  refer.target = target_uri;
+  refer.transferor_id = getOtherId();
+  refer.refer_req = req;
+
+  LocalReferStartEvent* ev = new LocalReferStartEvent(
+    getLocalTag(), req.cseq, target_party, target_uri, invite_hdrs);
+  if (!AmSessionContainer::instance()->postEvent(refer.transferor_id, ev)) {
+    ILOG_DLG(L_ERR, "local REFER on leg %s: peer leg '%s' is unavailable\n",
+		  getLocalTag().c_str(), refer.transferor_id.c_str());
+    dlg->reply(req, 500, SIP_REPLY_SERVER_INTERNAL_ERROR);
+    clearLocalReferTransfer();
+  }
+}
+
+void SBCCallLeg::onLocalReferStart(LocalReferStartEvent* ev)
+{
+  if (!ev || call_profile.getReferMode() != SBCCallProfile::ReferModeLocal)
+    return;
+
+  if (getCallStatus() != Connected ||
+      (local_refer.get() && local_refer->active) ||
+      dlg->getUACInvTransPending() || dlg->getUASPendingInv()) {
+    AmSessionContainer::instance()->postEvent(ev->transferor_id,
+      new LocalReferCreatedEvent(ev->refer_cseq, false, "", 491,
+				 SIP_REPLY_PENDING));
+    return;
+  }
+
+  SBCCallLeg* callee = NULL;
+  bool added = false;
+  string new_leg_id;
+  try {
+    string invite_hdrs(ev->invite_hdrs);
+    inplaceHeaderFilter(invite_hdrs, call_profile.headerfilter);
+
+    AmSipRequest invite_req;
+    if (!buildLocalReferInvite(dlg->getRemoteParty(), dlg->getLocalParty(),
+			       ev->target_party, ev->target_uri,
+			       invite_hdrs, invite_req)) {
+      AmSessionContainer::instance()->postEvent(ev->transferor_id,
+	new LocalReferCreatedEvent(ev->refer_cseq, false, "", 500,
+				   SIP_REPLY_SERVER_INTERNAL_ERROR));
+      return;
+    }
+
+    callee = SBCFactory::instance()->getCallLegCreator()->create(this);
+    callee->local_refer.reset(new LocalReferContext(
+      a_leg ? LocalReferProfileA : LocalReferProfileB, invite_req));
+    callee->setLocalParty(invite_req.from, invite_req.from_uri);
+    callee->setRemoteParty(ev->target_party, ev->target_uri);
+
+    AmMimeBody invite_body(dlg->established_body);
+    if (callee->filterSdp(invite_body, SIP_METH_INVITE) < 0)
+      throw AmSession::Exception(488, SIP_REPLY_NOT_ACCEPTABLE_HERE);
+
+    LocalReferProfileSide profile_side = local_refer.get() ?
+      local_refer->profile_side : LocalReferProfileNone;
+    local_refer.reset(new LocalReferContext(profile_side));
+    LocalReferContext& refer = *local_refer;
+    refer.active = true;
+    refer.orchestrator = true;
+    refer.refer_cseq = ev->refer_cseq;
+    refer.target = ev->target_uri;
+    refer.transferor_id = ev->transferor_id;
+    refer.new_leg_id = callee->getLocalTag();
+    new_leg_id = refer.new_leg_id;
+    refer.previous_body = dlg->established_body;
+    refer.previous_body_hash = body_hash;
+
+    addCallee(callee, invite_req.hdrs, invite_body);
+    added = true;
+
+    if (!AmSessionContainer::instance()->postEvent(ev->transferor_id,
+	  new LocalReferCreatedEvent(ev->refer_cseq, true,
+				     refer.new_leg_id))) {
+      discardCallee(refer.new_leg_id);
+      clearLocalReferTransfer();
+    }
+  }
+  catch (...) {
+    if (added) discardCallee(new_leg_id);
+    else if (callee) delete callee;
+    clearLocalReferTransfer();
+    AmSessionContainer::instance()->postEvent(ev->transferor_id,
+      new LocalReferCreatedEvent(ev->refer_cseq, false, "", 500,
+				 SIP_REPLY_SERVER_INTERNAL_ERROR));
+  }
+}
+
+void SBCCallLeg::onLocalReferCreated(LocalReferCreatedEvent* ev)
+{
+  if (!ev || !local_refer.get() || !local_refer->active ||
+      local_refer->orchestrator ||
+      ev->refer_cseq != local_refer->refer_cseq)
+    return;
+  LocalReferContext& refer = *local_refer;
+
+  if (!ev->created) {
+    dlg->reply(refer.refer_req, ev->code, ev->reason);
+    clearLocalReferTransfer();
+    return;
+  }
+
+  refer.new_leg_id = ev->new_leg_id;
+  if (refer.subscription && !subs->onRequestIn(refer.refer_req)) {
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferAbortEvent(getLocalTag(), refer.refer_cseq));
+    clearLocalReferTransfer();
+    return;
+  }
+
+  string hdrs;
+  if (!refer.subscription) hdrs = "Refer-Sub: false" CRLF;
+  if (dlg->reply(refer.refer_req, 202, "Accepted", NULL, hdrs,
+		 SIP_FLAGS_VERBATIM) < 0) {
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferAbortEvent(getLocalTag(), refer.refer_cseq));
+    clearLocalReferTransfer();
+    return;
+  }
+
+  if (sendLocalReferNotify(100, SIP_REPLY_TRYING, false) < 0) {
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferAbortEvent(getLocalTag(), refer.refer_cseq));
+    clearLocalReferTransfer();
+  }
+}
+
+void SBCCallLeg::onLocalReferResult(LocalReferResultEvent* ev)
+{
+  if (!ev || !local_refer.get() || !local_refer->active ||
+      local_refer->orchestrator ||
+      ev->refer_cseq != local_refer->refer_cseq)
+    return;
+
+  sendLocalReferNotify(ev->code, ev->reason, ev->final);
+  if (!ev->final) return;
+
+  bool success = ev->code >= 200 && ev->code < 300;
+  clearLocalReferTransfer();
+  if (success) terminateLeg();
+}
+
+void SBCCallLeg::onLocalReferAbort(LocalReferAbortEvent* ev)
+{
+  if (!ev || !local_refer.get() || !local_refer->active ||
+      !local_refer->orchestrator ||
+      ev->refer_cseq != local_refer->refer_cseq ||
+      ev->transferor_id != local_refer->transferor_id)
+    return;
+  LocalReferContext& refer = *local_refer;
+
+  dlg->established_body = refer.previous_body;
+  body_hash = refer.previous_body_hash;
+  restoreCalleeMedia(refer.media_handover);
+  discardCallee(refer.new_leg_id);
+  clearLocalReferTransfer();
+}
+
+bool SBCCallLeg::onLocalReferCandidateReply(B2BSipReplyEvent* ev)
+{
+  if (!ev || !local_refer.get() || !local_refer->active ||
+      !local_refer->orchestrator ||
+      (ev->sender_ltag != local_refer->new_leg_id &&
+       ev->reply.from_tag != local_refer->new_leg_id))
+    return false;
+  LocalReferContext& refer = *local_refer;
+
+  if (ev->reply.code < 200) {
+    if (ev->reply.code == 180 || ev->reply.code == 183) {
+      AmSessionContainer::instance()->postEvent(refer.transferor_id,
+	new LocalReferResultEvent(refer.refer_cseq, ev->reply.code,
+				  ev->reply.reason, false));
+    }
+    return true;
+  }
+
+  if (ev->reply.code >= 300) {
+    discardCallee(refer.new_leg_id);
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferResultEvent(refer.refer_cseq, ev->reply.code,
+				 ev->reply.reason, true));
+    clearLocalReferTransfer();
+    return true;
+  }
+
+  if (!prepareCalleeMedia(refer.new_leg_id, refer.media_handover) ||
+      !saveSessionDescription(ev->reply.body) ||
+      sendEstablishedReInvite() < 0) {
+    dlg->established_body = refer.previous_body;
+    body_hash = refer.previous_body_hash;
+    restoreCalleeMedia(refer.media_handover);
+    discardCallee(refer.new_leg_id);
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferResultEvent(refer.refer_cseq, 500,
+				 SIP_REPLY_SERVER_INTERNAL_ERROR, true));
+    clearLocalReferTransfer();
+    return true;
+  }
+
+  refer.switch_cseq = dlg->cseq - 1;
+  return true;
+}
+
+void SBCCallLeg::abortLocalRefer()
+{
+  if (!local_refer.get() || !local_refer->active) return;
+  LocalReferContext& refer = *local_refer;
+
+  if (refer.orchestrator) {
+    dlg->established_body = refer.previous_body;
+    body_hash = refer.previous_body_hash;
+    restoreCalleeMedia(refer.media_handover);
+    discardCallee(refer.new_leg_id);
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferResultEvent(refer.refer_cseq, 487,
+				 "Request Terminated", true));
+  }
+  else if (!refer.transferor_id.empty()) {
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferAbortEvent(getLocalTag(), refer.refer_cseq));
+  }
+  local_refer.reset();
 }
 
 void SBCCallLeg::onSipRequest(const AmSipRequest& req) {
@@ -694,6 +1292,12 @@ void SBCCallLeg::onSipRequest(const AmSipRequest& req) {
     }
   }
 
+  if (req.method == SIP_METH_REFER &&
+      call_profile.getReferMode() == SBCCallProfile::ReferModeLocal) {
+    handleLocalRefer(req);
+    return;
+  }
+
   if (fwd && req.method == SIP_METH_INVITE) {
     ILOG_DLG(L_DBG, "replying 100 Trying to INVITE to be fwd'ed\n");
     dlg->reply(req, 100, SIP_REPLY_TRYING);
@@ -740,6 +1344,10 @@ void SBCCallLeg::onSipReply(const AmSipRequest& req, const AmSipReply& reply,
         ILOG_DLG(L_DBG, "uac_auth consumed reply with cseq %d and resent with cseq %d; "
             "updating relayed_req map\n", reply.cseq, cseq_before);
         updateUACTransCSeq(reply.cseq, cseq_before);
+	if (local_refer.get() && local_refer->active &&
+	    local_refer->orchestrator &&
+	    local_refer->switch_cseq == reply.cseq)
+	  local_refer->switch_cseq = cseq_before;
 
 	// don't relay to other leg, process in AmSession
 	AmSession::onSipReply(req, reply, old_dlg_status);
@@ -755,12 +1363,63 @@ void SBCCallLeg::onSipReply(const AmSipRequest& req, const AmSipReply& reply,
     }
   }
 
+  set<unsigned int>::iterator notify_it;
+  bool local_notify = false;
+  if (local_refer.get()) {
+    notify_it = local_refer->notify_cseqs.find(reply.cseq);
+    local_notify = notify_it != local_refer->notify_cseqs.end();
+  }
+  if (req.method == SIP_METH_NOTIFY && local_notify) {
+    if (subs->onReplyIn(req, reply))
+      AmSession::onSipReply(req, reply, old_dlg_status);
+    if (reply.code >= 200) {
+      local_refer->notify_cseqs.erase(notify_it);
+      if (!local_refer->active &&
+          local_refer->profile_side == LocalReferProfileNone &&
+          local_refer->notify_cseqs.empty())
+        local_refer.reset();
+    }
+    return;
+  }
+
+  if (local_refer.get() && local_refer->active &&
+      local_refer->orchestrator &&
+      reply.cseq_method == SIP_METH_INVITE &&
+      reply.cseq == local_refer->switch_cseq) {
+    LocalReferContext& refer = *local_refer;
+    AmSession::onSipReply(req, reply, old_dlg_status);
+    if (reply.code < 200) return;
+
+    if (reply.code < 300 && adoptPreparedCallee(refer.new_leg_id)) {
+      commitCalleeMedia(refer.media_handover);
+      AmSessionContainer::instance()->postEvent(refer.transferor_id,
+	new LocalReferResultEvent(refer.refer_cseq, 200, "OK", true));
+      clearLocalReferTransfer();
+      return;
+    }
+
+    unsigned int code = reply.code < 300 ? 500 : reply.code;
+    string reason = reply.code < 300 ? SIP_REPLY_SERVER_INTERNAL_ERROR : reply.reason;
+    dlg->established_body = refer.previous_body;
+    body_hash = refer.previous_body_hash;
+    restoreCalleeMedia(refer.media_handover);
+    discardCallee(refer.new_leg_id);
+    AmSessionContainer::instance()->postEvent(refer.transferor_id,
+      new LocalReferResultEvent(refer.refer_cseq, code, reason, true));
+    clearLocalReferTransfer();
+    return;
+  }
+
   CallLeg::onSipReply(req, reply, old_dlg_status);
 }
 
 void SBCCallLeg::onSendRequest(AmSipRequest& req, int &flags) {
 
-  if(a_leg) {
+  bool use_aleg_profile =
+    (local_refer.get() && local_refer->profile_side == LocalReferProfileA) ||
+    ((!local_refer.get() ||
+      local_refer->profile_side == LocalReferProfileNone) && a_leg);
+  if (use_aleg_profile) {
     if (!call_profile.aleg_append_headers_req.empty()) {
       ILOG_DLG(L_DBG, "appending '%s' to outbound request (A leg)\n",
 	  call_profile.aleg_append_headers_req.c_str());
@@ -800,6 +1459,7 @@ void SBCCallLeg::onRtpTimeout()
 
 void SBCCallLeg::onBye(const AmSipRequest& req)
 {
+  abortLocalRefer();
   CallLeg::onBye(req);
   if(a_leg)
     SBCEventLog::instance()->logCallEnd(req,getLocalTag(),"bye",&call_connect_ts);
@@ -807,6 +1467,7 @@ void SBCCallLeg::onBye(const AmSipRequest& req)
 
 void SBCCallLeg::onOtherBye(const AmSipRequest& req)
 {
+  abortLocalRefer();
   CallLeg::onOtherBye(req);
   if(a_leg)
     SBCEventLog::instance()->logCallEnd(req,getLocalTag(),"bye",&call_connect_ts);
@@ -865,6 +1526,39 @@ void SBCCallLeg::onControlCmd(string& cmd, AmArg& params) {
 void SBCCallLeg::process(AmEvent* ev) {
   for (vector<ExtendedCCInterface*>::iterator i = cc_ext.begin(); i != cc_ext.end(); ++i) {
     if ((*i)->onEvent(this, ev) == StopProcessing) return;
+  }
+
+  if (call_profile.getReferMode() == SBCCallProfile::ReferModeLocal) {
+    switch (ev->event_id) {
+    case LocalReferStartEventId:
+      onLocalReferStart(dynamic_cast<LocalReferStartEvent*>(ev));
+      return;
+    case LocalReferCreatedEventId:
+      if (local_refer.get()) {
+        onLocalReferCreated(dynamic_cast<LocalReferCreatedEvent*>(ev));
+        return;
+      }
+      break;
+    case LocalReferResultEventId:
+      if (local_refer.get()) {
+        onLocalReferResult(dynamic_cast<LocalReferResultEvent*>(ev));
+        return;
+      }
+      break;
+    case LocalReferAbortEventId:
+      if (local_refer.get()) {
+        onLocalReferAbort(dynamic_cast<LocalReferAbortEvent*>(ev));
+        return;
+      }
+      break;
+    case B2BSipReply:
+      if (local_refer.get() &&
+          onLocalReferCandidateReply(dynamic_cast<B2BSipReplyEvent*>(ev)))
+        return;
+      break;
+    default:
+      break;
+    }
   }
 
   if (a_leg) {
@@ -2137,6 +2831,9 @@ void SBCCallLeg::copyGlobalSettings(const SBCCallProfile& callee_profile)
 
   call_profile.allow_subless_notify = callee_profile.allow_subless_notify;
   subs->allowUnsolicitedNotify(call_profile.allow_subless_notify);
+  call_profile.setReferPolicy(callee_profile.getReferMode(),
+			      callee_profile.getReferLocalLeg(),
+			      callee_profile.getReferLocalDomain());
   
   call_profile.headerfilter    = callee_profile.headerfilter;
   call_profile.messagefilter   = callee_profile.messagefilter;

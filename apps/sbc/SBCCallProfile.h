@@ -86,6 +86,17 @@ typedef map<unsigned int, ReplyCodeReasonPair> ReplyTranslationMap;
 
 struct SBCCallProfile
   : public AmObject {
+  enum ReferMode {
+    ReferModeRelay = 0,
+    ReferModeLocal
+  };
+
+  enum ReferLocalLeg {
+    ReferLocalLegB = 0,
+    ReferLocalLegA,
+    ReferLocalLegBoth
+  };
+
   string md5hash;
   string profile_file;
 
@@ -392,6 +403,26 @@ struct SBCCallProfile
   { }
 
   bool readFromConfiguration(const string& name, const string profile_file_name);
+
+  static ReferMode parseReferMode(const string& value, bool* valid = NULL);
+  static const char* referModeToStr(ReferMode mode);
+  static ReferLocalLeg parseReferLocalLeg(const string& value,
+					  bool* valid = NULL);
+  static const char* referLocalLegToStr(ReferLocalLeg leg);
+  static bool isValidReferLocalDomain(const string& domain);
+  ReferMode getReferMode() const;
+  ReferLocalLeg getReferLocalLeg() const;
+  string getReferLocalDomain() const;
+  void setReferPolicy(ReferMode mode, ReferLocalLeg leg,
+		      const string& domain);
+  bool hasLocalReferRouting() const {
+    return isValidReferLocalDomain(getReferLocalDomain());
+  }
+  bool allowsLocalRefer(bool on_a_leg) const {
+    ReferLocalLeg leg = getReferLocalLeg();
+    return leg == ReferLocalLegBoth ||
+      (on_a_leg ? leg == ReferLocalLegA : leg == ReferLocalLegB);
+  }
 
   bool operator==(const SBCCallProfile& rhs) const;
   string print() const;

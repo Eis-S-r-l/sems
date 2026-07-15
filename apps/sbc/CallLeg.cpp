@@ -1534,6 +1534,104 @@ void CallLeg::addCallee(CallLeg *callee, const string &hdrs)
   else addNewCallee(callee, new ConnectLegEvent(hdrs, dlg->established_body));
 }
 
+bool CallLeg::adoptPreparedCallee(const string &id)
+{
+  if (getCallStatus() != Connected) {
+    ILOG_DLG(L_WARN, "cannot adopt callee %s in %s state\n",
+	 id.c_str(), callStatus2str(getCallStatus()));
+    return false;
+  }
+
+  vector<OtherLegInfo>::iterator selected = other_legs.end();
+  for (vector<OtherLegInfo>::iterator i = other_legs.begin();
+       i != other_legs.end(); ++i) {
+    if (i->id == id) {
+      selected = i;
+      break;
+    }
+  }
+  if (selected == other_legs.end() || getMediaSession() != selected->media_session) {
+    ILOG_DLG(L_ERR, "callee %s has no prepared media session\n", id.c_str());
+    return false;
+  }
+
+  setOtherId(id);
+  if (!selected->media_session && rtp_relay_mode != AmB2BSession::RTP_Direct)
+    setRtpRelayMode(AmB2BSession::RTP_Direct);
+  set_sip_relay_only(true);
+
+  terminateNotConnectedLegs();
+  if (!other_legs.empty())
+    other_legs.begin()->releaseMediaSession();
+  other_legs.clear();
+  return true;
+}
+
+bool CallLeg::prepareCalleeMedia(const string &id,
+                                 MediaSessionHandover &handover)
+{
+  if (handover.prepared) {
+    ILOG_DLG(L_ERR, "media handover already prepared for callee %s\n",
+             id.c_str());
+    return false;
+  }
+
+  for (vector<OtherLegInfo>::iterator i = other_legs.begin();
+       i != other_legs.end(); ++i) {
+    if (i->id != id) continue;
+
+    handover.previous = swapMediaSession(i->media_session);
+    handover.prepared = true;
+    if (i->media_session)
+      i->media_session->changeSession(a_leg, this);
+    return true;
+  }
+
+  ILOG_DLG(L_ERR, "callee %s is unavailable for media handover\n",
+           id.c_str());
+  return false;
+}
+
+void CallLeg::restoreCalleeMedia(MediaSessionHandover &handover)
+{
+  if (!handover.prepared) return;
+
+  // Stop and release the candidate-side reference held by this leg.
+  clearRtpReceiverRelay();
+
+  AmB2BMedia *unexpected = swapMediaSession(handover.previous);
+  if (unexpected) {
+    ILOG_DLG(L_ERR, "unexpected media session while restoring handover\n");
+    unexpected->releaseReference();
+  }
+  if (handover.previous)
+    handover.previous->changeSession(a_leg, this);
+
+  // swapMediaSession() added the current-leg reference; release the
+  // transferred reference retained for rollback.
+  if (handover.previous)
+    handover.previous->releaseReference();
+  handover.clear();
+}
+
+void CallLeg::commitCalleeMedia(MediaSessionHandover &handover)
+{
+  if (!handover.prepared) return;
+
+  if (handover.previous) {
+    handover.previous->stop(a_leg);
+    handover.previous->releaseReference();
+  }
+  handover.clear();
+}
+
+void CallLeg::discardCallee(const string &id)
+{
+  if (id.empty() || id == getOtherId()) return;
+  AmSessionContainer::instance()->postEvent(id, new B2BEvent(B2BTerminateLeg));
+  removeOtherLeg(id);
+}
+
 /*void CallLeg::addCallee(CallLeg *callee, const string &hdrs, AmB2BSession::RTPRelayMode mode)
 {
   addNewCallee(callee, new ConnectLegEvent(hdrs, dlg->established_body), mode);

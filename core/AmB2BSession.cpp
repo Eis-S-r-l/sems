@@ -1792,6 +1792,19 @@ void AmB2BSession::setMediaSession(AmB2BMedia *new_session)
     media_session->addReference(); // new reference for me
 }
 
+AmB2BMedia *AmB2BSession::swapMediaSession(AmB2BMedia *new_session)
+{
+  if (media_session == new_session) return NULL;
+
+  AmB2BMedia *old_session = media_session;
+  media_session = new_session;
+  if (media_session)
+    media_session->addReference();
+
+  // Ownership of the old session reference is transferred to the caller.
+  return old_session;
+}
+
 /** Create an RTP transport for the given RtpStream, if needed.
  * If there is no corresponding remote media (same idx), return NULL.
  */

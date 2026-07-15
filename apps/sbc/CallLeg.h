@@ -282,6 +282,33 @@ class CallLeg: public AmB2BSession
 
     // functions offered to successors
 
+    struct MediaSessionHandover {
+      bool prepared;
+      AmB2BMedia *previous;
+
+      MediaSessionHandover() : prepared(false), previous(NULL) { }
+      void clear() { prepared = false; previous = NULL; }
+    };
+
+    /** Adopt a callee whose media was prepared by prepareCalleeMedia(). */
+    bool adoptPreparedCallee(const string &id);
+
+    /** Prepare the selected callee's media session for a transactional
+     * handover, including the valid case where the previous session is NULL. */
+    bool prepareCalleeMedia(const string &id, MediaSessionHandover &handover);
+
+    /** Restore/commit a media handover started by prepareCalleeMedia(). */
+    void restoreCalleeMedia(MediaSessionHandover &handover);
+    void commitCalleeMedia(MediaSessionHandover &handover);
+
+    /** Remove and terminate a callee which has not been adopted. */
+    void discardCallee(const string &id);
+
+    /** Add a generated callee with an explicitly prepared body. */
+    void addCallee(CallLeg *callee, const string &hdrs,
+		   const AmMimeBody &body)
+      { addNewCallee(callee, new ConnectLegEvent(hdrs, body)); }
+
     virtual void setCallStatus(CallStatus new_status);
     CallStatus getCallStatus() { return call_status; }
 

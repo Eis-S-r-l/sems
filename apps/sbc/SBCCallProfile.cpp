@@ -26,6 +26,7 @@
 #include "SBCCallProfile.h"
 #include "SBC.h"
 #include <algorithm>
+#include <cctype>
 #include <memory>
 
 #include "log.h"
@@ -43,6 +44,18 @@
 using std::make_shared;
 typedef vector<SdpPayload>::iterator PayloadIterator;
 static string payload2str(const SdpPayload &p);
+
+namespace {
+const char REFER_MODE_VAR[] = "__sbc_internal_refer_mode";
+const char REFER_LOCAL_LEG_VAR[] = "__sbc_internal_refer_local_leg";
+const char REFER_LOCAL_DOMAIN_VAR[] = "__sbc_internal_refer_local_domain";
+
+string getProfileString(const SBCVarMapT& vars, const char *key)
+{
+  SBCVarMapConstIteratorT it = vars.find(key);
+  return it != vars.end() && isArgCStr(it->second) ? it->second.asCStr() : "";
+}
+}
 
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -142,6 +155,111 @@ static string payload2str(const SdpPayload &p);
 
 //////////////////////////////////////////////////////////////////////////////////
 
+SBCCallProfile::ReferMode SBCCallProfile::parseReferMode(const string& value,
+							 bool* valid)
+{
+  string mode(value);
+  transform(mode.begin(), mode.end(), mode.begin(), ::tolower);
+
+  if (valid) *valid = true;
+  if (mode.empty() || mode == "relay") return ReferModeRelay;
+  if (mode == "local") return ReferModeLocal;
+
+  if (valid) *valid = false;
+  return ReferModeRelay;
+}
+
+const char* SBCCallProfile::referModeToStr(ReferMode mode)
+{
+  switch (mode) {
+  case ReferModeLocal: return "local";
+  case ReferModeRelay:
+  default: return "relay";
+  }
+}
+
+SBCCallProfile::ReferLocalLeg
+SBCCallProfile::parseReferLocalLeg(const string& value, bool* valid)
+{
+  string leg(value);
+  transform(leg.begin(), leg.end(), leg.begin(), ::tolower);
+
+  if (valid) *valid = true;
+  if (leg.empty() || leg == "bleg") return ReferLocalLegB;
+  if (leg == "aleg") return ReferLocalLegA;
+  if (leg == "both") return ReferLocalLegBoth;
+
+  if (valid) *valid = false;
+  return ReferLocalLegB;
+}
+
+const char* SBCCallProfile::referLocalLegToStr(ReferLocalLeg leg)
+{
+  switch (leg) {
+  case ReferLocalLegA: return "aleg";
+  case ReferLocalLegBoth: return "both";
+  case ReferLocalLegB:
+  default: return "bleg";
+  }
+}
+
+bool SBCCallProfile::isValidReferLocalDomain(const string& domain)
+{
+  if (domain.empty() || domain.size() > 253 || domain[0] == '.' ||
+      domain[domain.size() - 1] == '.')
+    return false;
+
+  bool label_start = true;
+  for (string::const_iterator it = domain.begin(); it != domain.end(); ++it) {
+    unsigned char c = static_cast<unsigned char>(*it);
+    if (c == '.') {
+      if (label_start || *(it - 1) == '-') return false;
+      label_start = true;
+      continue;
+    }
+    if (!(isalnum(c) || c == '-')) return false;
+    if (label_start && c == '-') return false;
+    label_start = false;
+  }
+
+  return !label_start && domain[domain.size() - 1] != '-';
+}
+
+SBCCallProfile::ReferMode SBCCallProfile::getReferMode() const
+{
+  return getProfileString(cc_vars, REFER_MODE_VAR) == "local" ?
+    ReferModeLocal : ReferModeRelay;
+}
+
+SBCCallProfile::ReferLocalLeg SBCCallProfile::getReferLocalLeg() const
+{
+  bool valid = false;
+  ReferLocalLeg leg = parseReferLocalLeg(
+    getProfileString(cc_vars, REFER_LOCAL_LEG_VAR), &valid);
+  return valid ? leg : ReferLocalLegB;
+}
+
+string SBCCallProfile::getReferLocalDomain() const
+{
+  return getProfileString(cc_vars, REFER_LOCAL_DOMAIN_VAR);
+}
+
+void SBCCallProfile::setReferPolicy(ReferMode mode, ReferLocalLeg leg,
+				    const string& domain)
+{
+  cc_vars.erase(REFER_MODE_VAR);
+  cc_vars.erase(REFER_LOCAL_LEG_VAR);
+  cc_vars.erase(REFER_LOCAL_DOMAIN_VAR);
+
+  if (mode != ReferModeLocal) return;
+
+  cc_vars[REFER_MODE_VAR] = "local";
+  cc_vars[REFER_LOCAL_LEG_VAR] = referLocalLegToStr(leg);
+  cc_vars[REFER_LOCAL_DOMAIN_VAR] = domain;
+}
+
+//////////////////////////////////////////////////////////////////////////////////
+
 bool SBCCallProfile::readFromConfiguration(const string& name,
 					   const string profile_file_name) {
   AmConfigReader cfg;
@@ -177,6 +295,30 @@ bool SBCCallProfile::readFromConfiguration(const string& name,
   aleg_next_hop = cfg.getParameter("aleg_next_hop");
 
   allow_subless_notify = cfg.getParameter("allow_subless_notify", "yes") == "yes";
+
+  bool valid_refer_mode = false;
+  string refer_mode_cfg = cfg.getParameter("refer_mode");
+  ReferMode refer_mode = parseReferMode(refer_mode_cfg, &valid_refer_mode);
+  if (!valid_refer_mode) {
+    WARN("SBC profile '%s': invalid refer_mode '%s', using 'relay'\n",
+	 name.c_str(), refer_mode_cfg.c_str());
+  }
+  string refer_local_domain = cfg.getParameter("refer_local_domain");
+  bool valid_refer_local_leg = false;
+  string refer_local_leg_cfg = cfg.getParameter("refer_local_leg");
+  ReferLocalLeg refer_local_leg = parseReferLocalLeg(refer_local_leg_cfg,
+					      &valid_refer_local_leg);
+  if (!valid_refer_local_leg) {
+    WARN("SBC profile '%s': invalid refer_local_leg '%s', using 'bleg'\n",
+	 name.c_str(), refer_local_leg_cfg.c_str());
+  }
+  if (refer_mode == ReferModeLocal &&
+      !isValidReferLocalDomain(refer_local_domain)) {
+    WARN("SBC profile '%s': refer_mode=local requires a valid "
+	 "refer_local_domain; local REFER requests will be rejected\n",
+	 name.c_str());
+  }
+  setReferPolicy(refer_mode, refer_local_leg, refer_local_domain);
 
   if (!readFilter(cfg, "header_filter", "header_list", headerfilter, false))
     return false;
@@ -470,6 +612,14 @@ bool SBCCallProfile::readFromConfiguration(const string& name,
       INFO("SBC:      A leg next hop = %s\n", aleg_next_hop.c_str());
     }
 
+    if (getReferMode() == ReferModeLocal) {
+      INFO("SBC:      REFER mode = local\n");
+      INFO("SBC:      REFER local leg = %s\n",
+	   referLocalLegToStr(getReferLocalLeg()));
+      INFO("SBC:      REFER local domain = %s\n",
+	   getReferLocalDomain().c_str());
+    }
+
     string filter_type; size_t filter_elems;
     filter_type = headerfilter.size() ?
       FilterType2String(headerfilter.back().filter_type) : "disabled";
@@ -644,6 +794,9 @@ bool SBCCallProfile::operator==(const SBCCallProfile& rhs) const {
     next_hop_fixed == rhs.next_hop_fixed &&
     patch_ruri_next_hop == rhs.patch_ruri_next_hop &&
     aleg_next_hop == rhs.aleg_next_hop &&
+    getReferMode() == rhs.getReferMode() &&
+    getReferLocalLeg() == rhs.getReferLocalLeg() &&
+    getReferLocalDomain() == rhs.getReferLocalDomain() &&
     headerfilter == rhs.headerfilter &&
     //headerfilter_list == rhs.headerfilter_list &&
     messagefilter == rhs.messagefilter &&
@@ -702,6 +855,12 @@ string SBCCallProfile::print() const {
   res += "next_hop_1st_req:     " + string(next_hop_1st_req ? "true":"false") + "\n";
   res += "next_hop_fixed:       " + string(next_hop_fixed ? "true":"false") + "\n";
   res += "aleg_next_hop:        " + aleg_next_hop + "\n";
+  if (getReferMode() == ReferModeLocal) {
+    res += "refer_mode:           local\n";
+    res += "refer_local_leg:      " +
+      string(referLocalLegToStr(getReferLocalLeg())) + "\n";
+    res += "refer_local_domain:   " + getReferLocalDomain() + "\n";
+  }
   // res += "headerfilter:         " + string(FilterType2String(headerfilter)) + "\n";
   // res += "headerfilter_list:    " + stringset_print(headerfilter_list) + "\n";
   // res += "messagefilter:        " + string(FilterType2String(messagefilter)) + "\n";
